@@ -1,147 +1,226 @@
-import os
-os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-
-import sys
-import importlib.util
-from pathlib import Path
-
-# 업로드 과정에서 env.py가 env(1).py로 바뀐 경우도 대응
-if not Path("env.py").exists() and Path("env(1).py").exists():
-    spec = importlib.util.spec_from_file_location("env", "env(1).py")
-    env_mod = importlib.util.module_from_spec(spec)
-    sys.modules["env"] = env_mod
-    spec.loader.exec_module(env_mod)
+﻿import os
+import random
+from dataclasses import dataclass, field
 
 import gradio as gr
+import numpy as np
 from PIL import Image, ImageDraw
 
-from config import SCREEN_WIDTH, SCREEN_HEIGHT, ROAD_LEFT, ROAD_RIGHT, LANE_WIDTH, NUM_LANES, CAR_WIDTH, CAR_HEIGHT, CAR_Y
-from env import DrivingEnv
-from agent import DQNAgent
+WIDTH = 700
+HEIGHT = 900
 
-# Render에서 한 프로세스 안에서 유지되는 전역 객체
-ENV = DrivingEnv()
-AGENT = DQNAgent()
-try:
-    AGENT.load()
-except Exception as e:
-    print(f"[App] saved model load skipped: {e}")
+ROAD_LEFT = 150
+ROAD_RIGHT = 550
+LANE_WIDTH = (ROAD_RIGHT - ROAD_LEFT) // 3
+NUM_LANES = 3
 
-MODE = {"value": "Human"}
-LAST_STATE = {"obs": ENV._get_state()}
+CAR_W = 40
+CAR_H = 70
+CAR_Y = HEIGHT - 150
+
+OBS_W = 40
+OBS_H = 70
+OBS_SPAWN_PROB = 0.08
+OBS_MIN_SPEED = 8
+OBS_MAX_SPEED = 16
+MAX_OBS = 7
 
 
-def draw_frame():
-    img = Image.new("RGB", (SCREEN_WIDTH, SCREEN_HEIGHT), (8, 10, 20))
+def lane_center_x(lane):
+    return int(ROAD_LEFT + LANE_WIDTH * lane + LANE_WIDTH / 2)
+
+
+@dataclass
+class Obstacle:
+    lane: int
+    y: float
+    speed: float
+
+    @property
+    def x(self):
+        return lane_center_x(self.lane) - OBS_W // 2
+
+
+@dataclass
+class SimState:
+    car_lane: int = 1
+    car_x: float = field(default_factory=lambda: lane_center_x(1) - CAR_W // 2)
+    obstacles: list = field(default_factory=list)
+    step_count: int = 0
+    score: int = 0
+    crash_count: int = 0
+    total_reward: float = 0.0
+    scroll: int = 0
+    last_reward: float = 0.0
+    mode: str = "AI"
+
+
+state = SimState()
+
+
+def reset_state():
+    global state
+    state = SimState()
+    return render(), status_text()
+
+
+def rects_overlap(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+
+
+def choose_ai_action():
+    danger = {0: 9999, 1: 9999, 2: 9999}
+    for obs in state.obstacles:
+        dy = CAR_Y - (obs.y + OBS_H)
+        if 0 < dy < danger[obs.lane]:
+            danger[obs.lane] = dy
+
+    current = state.car_lane
+    if danger[current] < 180:
+        candidates = [0, 1, 2]
+        candidates.sort(key=lambda l: danger[l], reverse=True)
+        target = candidates[0]
+        if target < current:
+            return "LEFT"
+        if target > current:
+            return "RIGHT"
+    return "STRAIGHT"
+
+
+def step(mode, human_action="STRAIGHT"):
+    state.mode = mode
+    state.step_count += 1
+    state.scroll = (state.scroll + 8) % 70
+
+    action = choose_ai_action() if mode == "AI" else human_action
+
+    if action == "LEFT":
+        state.car_lane = max(0, state.car_lane - 1)
+    elif action == "RIGHT":
+        state.car_lane = min(NUM_LANES - 1, state.car_lane + 1)
+
+    target_x = lane_center_x(state.car_lane) - CAR_W // 2
+    state.car_x += 0.35 * (target_x - state.car_x)
+
+    if len(state.obstacles) < MAX_OBS and random.random() < OBS_SPAWN_PROB:
+        lane = random.randint(0, NUM_LANES - 1)
+        state.obstacles.append(Obstacle(lane, -OBS_H, random.uniform(OBS_MIN_SPEED, OBS_MAX_SPEED)))
+
+    reward = 0.05
+    new_obs = []
+    for obs in state.obstacles:
+        obs.y += obs.speed
+        if obs.y > HEIGHT + 30:
+            state.score += 10
+            reward += 1.0
+        else:
+            new_obs.append(obs)
+    state.obstacles = new_obs
+
+    car_rect = (int(state.car_x), CAR_Y, CAR_W, CAR_H)
+    crashed = False
+    for obs in state.obstacles:
+        obs_rect = (obs.x, int(obs.y), OBS_W, OBS_H)
+        if rects_overlap(car_rect, obs_rect):
+            crashed = True
+            break
+
+    if crashed:
+        reward -= 15.0
+        state.crash_count += 1
+        state.obstacles.clear()
+        state.car_lane = 1
+        state.car_x = lane_center_x(1) - CAR_W // 2
+
+    center_x = lane_center_x(state.car_lane) - CAR_W // 2
+    reward += max(0.0, 0.3 * (1 - abs(state.car_x - center_x) / (LANE_WIDTH / 2)))
+
+    state.last_reward = reward
+    state.total_reward += reward
+
+
+def run_once(mode, human_action):
+    step(mode, human_action)
+    return render(), status_text()
+
+
+def run_many(mode, human_action, n_steps):
+    for _ in range(int(n_steps)):
+        step(mode, human_action)
+    return render(), status_text()
+
+
+def render():
+    img = Image.new("RGB", (WIDTH, HEIGHT), (8, 10, 20))
     d = ImageDraw.Draw(img)
 
-    # road
-    d.rectangle([ROAD_LEFT, 0, ROAD_RIGHT, SCREEN_HEIGHT], fill=(28, 30, 45))
-    d.line([ROAD_LEFT, 0, ROAD_LEFT, SCREEN_HEIGHT], fill=(60, 65, 90), width=3)
-    d.line([ROAD_RIGHT, 0, ROAD_RIGHT, SCREEN_HEIGHT], fill=(60, 65, 90), width=3)
+    d.rectangle([ROAD_LEFT, 0, ROAD_RIGHT, HEIGHT], fill=(28, 30, 45))
+    d.line([ROAD_LEFT, 0, ROAD_LEFT, HEIGHT], fill=(80, 85, 110), width=3)
+    d.line([ROAD_RIGHT, 0, ROAD_RIGHT, HEIGHT], fill=(80, 85, 110), width=3)
+
     for lane in range(1, NUM_LANES):
-        x = ROAD_LEFT + lane * LANE_WIDTH
-        for y in range(0, SCREEN_HEIGHT, 70):
-            d.rectangle([x - 2, y, x + 2, y + 40], fill=(200, 200, 80))
+        x = ROAD_LEFT + LANE_WIDTH * lane
+        y = -70 + state.scroll
+        while y < HEIGHT:
+            d.rectangle([x - 2, y, x + 2, y + 40], fill=(220, 220, 90))
+            y += 70
 
-    # obstacles
-    for obs in ENV.obstacles:
-        d.rounded_rectangle([obs.left, obs.top, obs.right, obs.bottom], radius=5, fill=(220, 50, 50))
+    d.rectangle([0, 0, ROAD_LEFT - 5, HEIGHT], fill=(15, 18, 35))
+    d.rectangle([ROAD_RIGHT + 5, 0, WIDTH, HEIGHT], fill=(15, 18, 35))
 
-    # car
-    car = ENV.car_rect
-    d.rounded_rectangle([car.left, car.top, car.right, car.bottom], radius=6, fill=(0, 220, 180))
+    for obs in state.obstacles:
+        x, y = obs.x, int(obs.y)
+        d.rounded_rectangle([x, y, x + OBS_W, y + OBS_H], radius=6, fill=(220, 50, 50))
 
-    # panels text
-    d.text((15, 20), "LANE KEEPER RL", fill=(255, 50, 140))
-    d.text((15, 55), f"Mode: {MODE['value']}", fill=(230, 235, 255))
-    d.text((15, 80), f"Step: {ENV.step_count}", fill=(230, 235, 255))
-    d.text((15, 105), f"Score: {ENV.score}", fill=(230, 235, 255))
-    d.text((15, 130), f"Reward: {ENV.total_reward:.2f}", fill=(230, 235, 255))
-    d.text((565, 20), f"Episode: {AGENT.episode}", fill=(230, 235, 255))
-    d.text((565, 45), f"epsilon: {AGENT.epsilon:.3f}", fill=(230, 235, 255))
-    d.text((565, 70), f"loss: {AGENT.avg_loss():.4f}", fill=(230, 235, 255))
+    cx = int(state.car_x)
+    d.rounded_rectangle([cx, CAR_Y, cx + CAR_W, CAR_Y + CAR_H], radius=6, fill=(0, 220, 180))
+    d.rectangle([cx + 5, CAR_Y + 5, cx + 12, CAR_Y + 12], fill=(255, 255, 200))
+    d.rectangle([cx + CAR_W - 12, CAR_Y + 5, cx + CAR_W - 5, CAR_Y + 12], fill=(255, 255, 200))
 
-    return img
+    d.text((18, 25), "AUTODRIVE", fill=(255, 50, 140))
+    d.text((18, 55), "NO PYGAME", fill=(0, 220, 180))
+    d.text((18, 110), f"MODE: {state.mode}", fill=(230, 235, 255))
+    d.text((18, 140), f"STEP: {state.step_count}", fill=(230, 235, 255))
+    d.text((18, 170), f"SCORE: {state.score}", fill=(230, 235, 255))
+    d.text((18, 200), f"CRASH: {state.crash_count}", fill=(230, 235, 255))
+
+    d.text((ROAD_RIGHT + 22, 25), "REWARD", fill=(255, 50, 140))
+    d.text((ROAD_RIGHT + 22, 65), f"last {state.last_reward:+.3f}", fill=(230, 235, 255))
+    d.text((ROAD_RIGHT + 22, 100), f"total {state.total_reward:+.1f}", fill=(230, 235, 255))
+
+    return np.array(img)
 
 
 def status_text():
-    bd = ENV.reward_breakdown or {}
     return (
-        f"mode={MODE['value']} | step={ENV.step_count} | score={ENV.score} | "
-        f"total_reward={ENV.total_reward:.2f} | epsilon={AGENT.epsilon:.3f} | "
-        f"avg_loss={AGENT.avg_loss():.4f}\n"
-        f"reward_breakdown={bd}"
+        f"mode={state.mode} | step={state.step_count} | score={state.score} | "
+        f"crash={state.crash_count} | last_reward={state.last_reward:+.3f} | "
+        f"total_reward={state.total_reward:+.3f}"
     )
 
 
-def reset(mode):
-    MODE["value"] = mode
-    LAST_STATE["obs"] = ENV.reset()
-    return draw_frame(), status_text()
-
-
-def step(action_name, mode):
-    MODE["value"] = mode
-    action_map = {"Left": 0, "Straight": 1, "Right": 2}
-    obs = ENV._get_state()
-
-    if mode == "AI Test":
-        action = AGENT.act(obs, train=False)
-    else:
-        action = action_map[action_name]
-
-    next_obs, reward, done, info = ENV.step(action)
-    LAST_STATE["obs"] = next_obs
-    if done:
-        ENV.reset()
-    return draw_frame(), status_text()
-
-
-def train(n_steps, mode):
-    MODE["value"] = "Training"
-    obs = ENV._get_state()
-    episodes_finished = 0
-    for _ in range(int(n_steps)):
-        action = AGENT.act(obs, train=True)
-        next_obs, reward, done, info = ENV.step(action)
-        AGENT.push(obs, action, reward, next_obs, done)
-        AGENT.train_step()
-        obs = next_obs
-        if done:
-            AGENT.on_episode_end(ENV.total_reward, ENV.score)
-            obs = ENV.reset()
-            episodes_finished += 1
-    LAST_STATE["obs"] = obs
-    return draw_frame(), status_text() + f"\ntrained_steps={int(n_steps)}, episodes_finished={episodes_finished}"
-
-
-def save_model():
-    AGENT.save()
-    return "모델 저장 완료: driving_model.pth"
-
-
 with gr.Blocks(title="Autodrive AI") as demo:
-    gr.Markdown("# Autodrive AI — Lane Keeper RL")
-    with gr.Row():
-        frame = gr.Image(type="pil", label="Simulation")
-        with gr.Column():
-            mode = gr.Radio(["Human", "AI Test", "Training"], value="Human", label="Mode")
-            action = gr.Radio(["Left", "Straight", "Right"], value="Straight", label="Human Action")
-            status = gr.Textbox(label="Status", lines=8)
-            with gr.Row():
-                step_btn = gr.Button("Step")
-                reset_btn = gr.Button("Reset")
-            n_steps = gr.Slider(1, 500, value=50, step=1, label="Training steps")
-            train_btn = gr.Button("Train")
-            save_btn = gr.Button("Save model")
-            save_out = gr.Textbox(label="Save result")
+    gr.Markdown("# Autodrive AI — Render Safe Version")
+    gr.Markdown("이 버전은 Render 배포 안정성을 위해 pygame 없이 Gradio + Pillow만 사용합니다.")
 
-    demo.load(fn=lambda: (draw_frame(), status_text()), outputs=[frame, status])
-    step_btn.click(fn=step, inputs=[action, mode], outputs=[frame, status])
-    reset_btn.click(fn=reset, inputs=[mode], outputs=[frame, status])
-    train_btn.click(fn=train, inputs=[n_steps, mode], outputs=[frame, status])
-    save_btn.click(fn=save_model, outputs=save_out)
+    image = gr.Image(value=render(), label="Simulation", type="numpy")
+    status = gr.Textbox(value=status_text(), label="Status")
+
+    with gr.Row():
+        mode = gr.Radio(["AI", "HUMAN"], value="AI", label="Mode")
+        human_action = gr.Radio(["LEFT", "STRAIGHT", "RIGHT"], value="STRAIGHT", label="Human Action")
+        n_steps = gr.Slider(1, 200, value=20, step=1, label="Steps")
+
+    with gr.Row():
+        step_btn = gr.Button("Step")
+        run_btn = gr.Button("Run Steps")
+        reset_btn = gr.Button("Reset")
+
+    step_btn.click(run_once, inputs=[mode, human_action], outputs=[image, status])
+    run_btn.click(run_many, inputs=[mode, human_action, n_steps], outputs=[image, status])
+    reset_btn.click(reset_state, outputs=[image, status])
 
 
 if __name__ == "__main__":
