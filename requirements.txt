@@ -1,5 +1,3 @@
 gradio
 numpy
-torch
-pygame
 pillow
